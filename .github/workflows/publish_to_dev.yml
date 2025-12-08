@@ -37,14 +37,25 @@ jobs:
     - name: Rename Linux Artifacts (Strip abi3)
       if: runner.os == 'Linux'
       run: |
-        find . -name "*.so" | while read f; do
-           # Rename api_client.abi3.so -> api_client.so
-           newname=$(echo "$f" | sed 's/\.[^.]*\.so$/.so/') 
-           if [ "$f" != "$newname" ]; then
-             mv "$f" "$newname"
-             echo "Renamed $f -> $newname"
-           fi
-        done
+        python -c "
+        import os
+        import shutil
+        for root, dirs, files in os.walk('.'):
+            for file in files:
+                if file.endswith('.so'):
+                    # Target: module.so from module.abi3.so or module.cpython-....so
+                    # Split by first dot to preserve package name if possible, or careful suffix removal
+                    parts = file.split('.')
+                    if len(parts) > 2:
+                        # e.g. ['module', 'abi3', 'so'] -> module.so
+                        # e.g. ['module', 'cpython-310...', 'so'] -> module.so
+                        new_name = parts[0] + '.so'
+                        old_path = os.path.join(root, file)
+                        new_path = os.path.join(root, new_name)
+                        if old_path != new_path:
+                            print(f'Renaming {file} -> {new_name}')
+                            os.rename(old_path, new_path)
+        "
 
     - name: Rename MacOS Artifacts (Add .darwin suffix)
       if: runner.os == 'macOS'
@@ -183,16 +194,22 @@ jobs:
 
     - name: Prepare Repository
       run: |
-        # 移动 .so 文件到正确位置 (flatten if needed or just ensure they are in place)
-        # Linux artifact creation likely put them in place due to --inplace build
-        
         # Rename api_client.abi3.so -> api_client.so if not already done in build
-        find . -name "*.so" | while read f; do
-            newname=$(echo "$f" | sed 's/\.[^.]*\.so$/.so/') 
-            if [ "$f" != "$newname" ]; then
-              mv "$f" "$newname"
-            fi
-        done
+        # Using python for safety against shell regex issues
+        python -c "
+        import os
+        for root, dirs, files in os.walk('.'):
+            for file in files:
+                if file.endswith('.so'):
+                    parts = file.split('.')
+                    if len(parts) > 2:
+                        new_name = parts[0] + '.so'
+                        old_path = os.path.join(root, file)
+                        new_path = os.path.join(root, new_name)
+                        if old_path != new_path:
+                            print(f'Renaming {file} -> {new_name}')
+                            os.rename(old_path, new_path)
+        "
         
         # 修改 pyproject.toml
         sed -i 's/comfyui-banana-li/comfyui-banana-li-linux/g' pyproject.toml
