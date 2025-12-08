@@ -1,0 +1,320 @@
+
+name: Build and Publish to Dev
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Cython Extensions
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+        cache: 'pip'
+
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install setuptools Cython
+
+    - name: Build extensions (Stable ABI)
+      run: |
+        python setup.py build_ext --inplace
+
+    - name: Rename Linux Artifacts (Strip abi3)
+      if: runner.os == 'Linux'
+      run: |
+        find . -name "*.so" | while read f; do
+           # Rename api_client.abi3.so -> api_client.so
+           newname=$(echo "$f" | sed 's/\.[^.]*\.so$/.so/') 
+           if [ "$f" != "$newname" ]; then
+             mv "$f" "$newname"
+             echo "Renamed $f -> $newname"
+           fi
+        done
+
+    - name: Rename MacOS Artifacts (Add .darwin suffix)
+      if: runner.os == 'macOS'
+      run: |
+        find . -name "*.so" | while read f; do
+           # Rename api_client.cpython-310-darwin.so (or similar) -> api_client.darwin.so
+           # We strip ALL intermediate suffixes and append .darwin.so
+           base=$(echo "$f" | sed 's/\.[^/]*\.so$//')
+           newname="${base}.darwin.so"
+           mv "$f" "$newname"
+           echo "Renamed $f -> $newname"
+        done
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: compiled-${{ matrix.os }}
+        path: |
+          **/*.pyd
+          **/*.so
+        if-no-files-found: error
+
+  deploy-windows:
+    name: Deploy Windows (Dev)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Clean stale binaries
+      run: find . -name "*.pyd" -delete
+
+    - name: Download Windows artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: compiled-windows-latest
+        path: .
+
+    - name: Clean Source Code
+      run: |
+        python -c "
+        import os
+        EXCLUDE_DIRS = {'web', '.git', '.github', '__pycache__', 'build', 'dist', '.vscode', '.idea', 'tools', '.serena', '.test', '.doc', 'openspec', 'sam_hq'}
+        EXCLUDE_FILES = {'setup.py', '__init__.py', 'loader_bootstrap.py', 'check_files.py', 'install.py', 'blendmodes.py', 'imagefunc.py'}
+        for root, dirs, files in os.walk('.'):
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+            for file in files:
+                if file.endswith(('.py', '.c', '.cpp', '.h')):
+                    if file in EXCLUDE_FILES: continue
+                    print(f'Deleting {file}')
+                    os.remove(os.path.join(root, file))
+        "
+
+    - name: Verify Binaries
+      run: |
+        if [ -z "$(find . -name '*.pyd' -print -quit)" ]; then
+          echo "Error: No .pyd binaries found!"
+          exit 1
+        fi
+
+    - name: Prepare Repository
+      run: |
+        # 仅保留 Windows 二进制 (.pyd)
+        find . -name "*.so" -delete
+        
+        # 清理开发工具和元数据
+        rm -rf tools
+        rm -rf .github
+        rm -rf .git
+        rm -f setup.py
+        
+        # 获取版 本号
+        VERSION=$(grep -m 1 'version =' pyproject.toml | cut -d '"' -f 2)
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+    - name: Push to Windows Repo
+      env:
+        PUBLIC_REPO_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+        TARGET_REPO: "98624017/comfyui-banana-li"
+      run: |
+        git init
+        git config user.name "GitHub Action"
+        git config user.email "action@github.com"
+        git remote add origin "https://x-access-token:${PUBLIC_REPO_TOKEN}@github.com/${TARGET_REPO}.git"
+        
+        if git fetch origin dev; then
+          git branch dev origin/dev
+          git symbolic-ref HEAD refs/heads/dev
+          git reset
+        else
+          git checkout -b dev
+        fi
+        
+        git add .
+        if git diff-index --quiet HEAD --; then
+          echo "No changes."
+        else
+          git commit -m "Automated build release v${{ env.VERSION }} $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git push origin dev
+        fi
+
+  deploy-linux:
+    name: Deploy Linux (Main)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download Linux artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: compiled-ubuntu-latest
+        path: .
+
+    - name: Clean Source Code
+      run: |
+        python -c "
+        import os
+        EXCLUDE_DIRS = {'web', '.git', '.github', '__pycache__', 'build', 'dist', '.vscode', '.idea', 'tools', '.serena', '.test', '.doc', 'openspec', 'sam_hq'}
+        EXCLUDE_FILES = {'setup.py', '__init__.py', 'loader_bootstrap.py', 'check_files.py', 'install.py', 'blendmodes.py', 'imagefunc.py'}
+        for root, dirs, files in os.walk('.'):
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+            for file in files:
+                if file.endswith(('.py', '.c', '.cpp', '.h')):
+                    if file in EXCLUDE_FILES: continue
+                    print(f'Deleting {file}')
+                    os.remove(os.path.join(root, file))
+        "
+
+    - name: Verify Binaries
+      run: |
+        if [ -z "$(find . -name '*.so' -print -quit)" ]; then
+          echo "Error: No .so binaries found!"
+          exit 1
+        fi
+
+    - name: Prepare Repository
+      run: |
+        # 移动 .so 文件到正确位置 (flatten if needed or just ensure they are in place)
+        # Linux artifact creation likely put them in place due to --inplace build
+        
+        # Rename api_client.abi3.so -> api_client.so if not already done in build
+        find . -name "*.so" | while read f; do
+            newname=$(echo "$f" | sed 's/\.[^.]*\.so$/.so/') 
+            if [ "$f" != "$newname" ]; then
+              mv "$f" "$newname"
+            fi
+        done
+        
+        # 修改 pyproject.toml
+        sed -i 's/comfyui-banana-li/comfyui-banana-li-linux/g' pyproject.toml
+        sed -i 's/comfyui-banana-li/comfyui-banana-li-linux/g' .github/workflows/publish_action.yml || true
+
+        # 清理
+        rm -rf tools
+        rm -rf .git
+        rm -f setup.py
+        find . -name "*.pyd" -delete
+
+        # 获取版本号
+        VERSION=$(grep -m 1 'version =' pyproject.toml | cut -d '"' -f 2)
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+    - name: Push to Linux Repo
+      env:
+        PUBLIC_REPO_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+        TARGET_REPO: "98624017/comfyui-banana-li-linux"
+      run: |
+        git init
+        git config user.name "GitHub Action"
+        git config user.email "action@github.com"
+        git remote add origin "https://x-access-token:${PUBLIC_REPO_TOKEN}@github.com/${TARGET_REPO}.git"
+        
+        if git fetch origin main; then
+          git branch main origin/main
+          git symbolic-ref HEAD refs/heads/main
+          git reset
+        else
+          git checkout -b main
+        fi
+        
+        git add .
+        # Force add .so if they are ignored by global gitignore (though usually not in clean env)
+        find . -name "*.so" -exec git add -f {} +
+        
+        if git diff-index --quiet HEAD --; then
+          echo "No changes."
+        else
+          git commit -m "Automated build release v${{ env.VERSION }} (Linux)"
+          git push origin main
+        fi
+
+  deploy-mac:
+    name: Deploy Mac (Main)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download Mac artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: compiled-macos-latest
+        path: .
+
+    - name: Clean Source Code
+      run: |
+        python -c "
+        import os
+        EXCLUDE_DIRS = {'web', '.git', '.github', '__pycache__', 'build', 'dist', '.vscode', '.idea', 'tools', '.serena', '.test', '.doc', 'openspec', 'sam_hq'}
+        EXCLUDE_FILES = {'setup.py', '__init__.py', 'loader_bootstrap.py', 'check_files.py', 'install.py', 'blendmodes.py', 'imagefunc.py'}
+        for root, dirs, files in os.walk('.'):
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+            for file in files:
+                if file.endswith(('.py', '.c', '.cpp', '.h')):
+                    if file in EXCLUDE_FILES: continue
+                    print(f'Deleting {file}')
+                    os.remove(os.path.join(root, file))
+        "
+
+    - name: Verify Binaries
+      run: |
+        if [ -z "$(find . -name '*.so' -print -quit)" ]; then
+          echo "Error: No .so binaries found!"
+          exit 1
+        fi
+
+    - name: Prepare Repository
+      run: |
+        # 修改 pyproject.toml
+        sed -i 's/comfyui-banana-li/comfyui-banana-li-mac/g' pyproject.toml
+        sed -i 's/comfyui-banana-li/comfyui-banana-li-mac/g' .github/workflows/publish_action.yml || true
+
+        # 清理
+        rm -rf tools
+        rm -rf .git
+        rm -f setup.py
+        find . -name "*.pyd" -delete
+        # Keep only .darwin.so for Mac
+        find . -name "*.so" ! -name "*.darwin.so" -delete
+
+        # 获取版本号
+        VERSION=$(grep -m 1 'version =' pyproject.toml | cut -d '"' -f 2)
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+    - name: Push to Mac Repo
+      env:
+        PUBLIC_REPO_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+        TARGET_REPO: "98624017/comfyui-banana-li-mac"
+      run: |
+        git init
+        git config user.name "GitHub Action"
+        git config user.email "action@github.com"
+        git remote add origin "https://x-access-token:${PUBLIC_REPO_TOKEN}@github.com/${TARGET_REPO}.git"
+        
+        if git fetch origin main; then
+          git branch main origin/main
+          git symbolic-ref HEAD refs/heads/main
+          git reset
+        else
+          git checkout -b main
+        fi
+        
+        git add .
+        # Force add .darwin.so
+        find . -name "*.darwin.so" -exec git add -f {} +
+        
+        if git diff-index --quiet HEAD --; then
+          echo "No changes."
+        else
+          git commit -m "Automated build release v${{ env.VERSION }} (Mac)"
+          git push origin main
+        fi
