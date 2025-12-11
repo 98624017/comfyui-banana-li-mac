@@ -5,17 +5,13 @@ const TARGET_NODE = "XinbaoModelScopeCaption";
 const CHANNEL_BANANA = "香蕉同款渠道";
 const CHANNEL_MODAO = "魔搭社区";
 const BANANA_DEFAULT_MODEL = "gemini-2.5-flash-c";
-const BANANA_MODELS = [
-  "gemini-3-pro-preview-c（较耗时）",
-  "gemini-2.5-pro-c（较耗时）",
-  "gpt-4o-c",
-  "gemini-2.5-flash-c",
-];
-const MODAO_MODELS = [
-  "Qwen/Qwen3-VL-8B-Instruct",
-  "Qwen/Qwen3-VL-235B-A22B-Instruct",
-];
+
 const RANKING_URL = "https://lmarena.ai/leaderboard/vision";
+
+
+// Store lists globally for this session
+let GLOBAL_BANANA_MODELS = [];
+let GLOBAL_MODAO_MODELS = [];
 
 function findWidget(node, name) {
   return node.widgets?.find((w) => w.name === name);
@@ -32,15 +28,30 @@ function updateModelOptions(node) {
     return;
   }
 
+  // Use captured global lists first, fallback to widget options (if any), then empty
+  const bananaModels = GLOBAL_BANANA_MODELS.length > 0 ? GLOBAL_BANANA_MODELS : (modelWidget.options?.banana_models || []);
+  const modaoModels = GLOBAL_MODAO_MODELS.length > 0 ? GLOBAL_MODAO_MODELS : (modelWidget.options?.modao_models || []);
+
+  if (bananaModels.length === 0 && modaoModels.length === 0) {
+    // If running in an environment where beforeRegisterNodeDef didn't fire or data missing
+    console.warn("Banana-Li: Model lists not found. Ensure XinbaoModelScopeCaption node definition has banana_models/modao_models.");
+    // We do NOT return here blindly anymore. If we return, we leave the mixed list.
+    // But if we have no data, we can't do anything. 
+    // We can try to see if modelWidget has values and guess? No, unsafe.
+    return;
+  }
+
   const channel = normalizeChannel(channelWidget.value);
-  const values = channel === CHANNEL_MODAO ? MODAO_MODELS : BANANA_MODELS;
+  const values = channel === CHANNEL_MODAO ? modaoModels : bananaModels;
 
   modelWidget.options = modelWidget.options || {};
   modelWidget.options.values = values.slice();
 
+  // Handle current value validation
   if (!values.includes(modelWidget.value)) {
     const preferred = channel === CHANNEL_BANANA ? BANANA_DEFAULT_MODEL : values[0];
-    modelWidget.value = values.includes(preferred) ? preferred : values[0] || modelWidget.value; // 回退到当前频道的默认模型
+    // If preferred is valid, use it. Else use first available. Keep current if somehow valid (already checked via includes, so not valid)
+    modelWidget.value = values.includes(preferred) ? preferred : (values[0] || modelWidget.value);
   }
 
   node?.graph?.setDirtyCanvas(true, true);
@@ -103,6 +114,27 @@ app.registerExtension({
     if (nodeData?.name !== TARGET_NODE) {
       return;
     }
+
+    // Capture lists from nodeData.input.required (or optional) -> model
+    // Format is usually: { input: { required: { model: [ "Type", { ...options } ] } } }
+    if (nodeData.input?.required?.model?.[1]) {
+      const options = nodeData.input.required.model[1];
+      if (options.banana_models && Array.isArray(options.banana_models)) {
+        GLOBAL_BANANA_MODELS = options.banana_models;
+      }
+      if (options.modao_models && Array.isArray(options.modao_models)) {
+        GLOBAL_MODAO_MODELS = options.modao_models;
+      }
+    } else if (nodeData.input?.optional?.model?.[1]) { // Check optional just in case
+      const options = nodeData.input.optional.model[1];
+      if (options.banana_models && Array.isArray(options.banana_models)) {
+        GLOBAL_BANANA_MODELS = options.banana_models;
+      }
+      if (options.modao_models && Array.isArray(options.modao_models)) {
+        GLOBAL_MODAO_MODELS = options.modao_models;
+      }
+    }
+
     const onCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const result = onCreated?.apply(this, arguments);

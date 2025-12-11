@@ -9,7 +9,9 @@ const CHANNEL_BANANA = "香蕉同款渠道";
 const CHANNEL_MODAO = "魔搭社区";
 const TARGETS = [
   { className: "BananaImageNode", fields: ["banana_api_key"] },
+  { className: "XinbaoVideoGenerator", fields: ["banana_api_key"] },
   { className: "XinbaoModelScopeImageGenerate", fields: ["modelscope_api_key"] },
+  { className: "XinbaoModelScopeImageEdit", fields: ["api_key"] },
   { className: "XinbaoModelScopeCaption", fields: ["banana_api_key", "modelscope_api_key"] },
 ];
 const CLEANER_FIELDS = {
@@ -50,6 +52,22 @@ function setWidgetValue(widget, value) {
   if (!widget) return false;
   if (widget.value === value) return false;
   widget.value = value;
+  if (widget.inputEl) {
+    widget.inputEl.value = value;
+  }
+  if (widget.domEl) {
+    widget.domEl.value = value;
+  }
+  if (widget.element) {
+    widget.element.value = value;
+  }
+  if (widget.callback) {
+    try {
+      widget.callback(widget.value);
+    } catch (e) {
+      console.warn(`[${EXTENSION}] Widget callback failed`, e);
+    }
+  }
   return true;
 }
 
@@ -299,8 +317,10 @@ function applyBackfillTransient() {
   const setIfEmpty = (node, fieldName, value) => {
     const widget = findWidget(node, fieldName);
     if (!widget || isEmptyValue(widget.value) === false) return;
-    revertRecords.push({ widget, prev: widget.value });
-    widget.value = value;
+    const prev = widget.value;
+    if (!setWidgetValue(widget, value)) return;
+    revertRecords.push({ widget, prev, node });
+    markDirty(node);
   };
 
   const bananaNodes = findNodesByClassName("BananaImageNode");
@@ -310,10 +330,24 @@ function applyBackfillTransient() {
     }
   });
 
+  const bananaVideoNodes = findNodesByClassName("XinbaoVideoGenerator");
+  bananaVideoNodes.forEach((node) => {
+    if (!isEmptyValue(bananaKey)) {
+      setIfEmpty(node, "banana_api_key", bananaKey);
+    }
+  });
+
   const modaoNodes = findNodesByClassName("XinbaoModelScopeImageGenerate");
   modaoNodes.forEach((node) => {
     if (!isEmptyValue(modaoKey)) {
       setIfEmpty(node, "modelscope_api_key", modaoKey);
+    }
+  });
+
+  const modaoEditNodes = findNodesByClassName("XinbaoModelScopeImageEdit");
+  modaoEditNodes.forEach((node) => {
+    if (!isEmptyValue(modaoKey)) {
+      setIfEmpty(node, "api_key", modaoKey);
     }
   });
 
@@ -333,8 +367,9 @@ function applyBackfillTransient() {
   });
 
   return () => {
-    revertRecords.forEach(({ widget, prev }) => {
-      widget.value = prev;
+    revertRecords.forEach(({ widget, prev, node }) => {
+      setWidgetValue(widget, prev);
+      markDirty(node);
     });
   };
 }
