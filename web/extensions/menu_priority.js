@@ -1,5 +1,6 @@
 
-import { app } from "../../scripts/app.js";
+import { app } from "../../../scripts/app.js";
+
 
 /**
  * 心宝❤Banana 菜单置顶增强脚本

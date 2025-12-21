@@ -3,6 +3,210 @@ import { api } from "/scripts/api.js";
 
 const EXTENSION_NAME = "banana.snippetManager";
 const TARGET_NODE = "XinbaoPromptAssistantNode";
+const LEGACY_DEFAULT_NODE_SIZE = [500, 450];
+// 让节点默认更“扁长”，减少无意义的纵向空白（用户仍可手动调整并保存）
+const DEFAULT_NODE_SIZE = [760, 300];
+// 旧版本在窄宽度下会因“自动撑高显示全部标签”导致节点被保存为超高尺寸，这里做一次性迁移兜底
+const LEGACY_TALL_NODE_MIN_HEIGHT = 650;
+
+// --- Prompt textarea height defaults (UX) ---
+// 目标：提示词输入框默认高度适中；随节点缩放实时变化（由节点 size 持久化）。
+const PROMPT_TEXTAREA_WIDGET_NAMES = ["text", "prefix_text"];
+// 默认高度：用户希望更舒适（32 太小）
+const PROMPT_TEXTAREA_DEFAULT_HEIGHT_PX = 250;
+const PROMPT_TEXTAREA_MIN_HEIGHT_PX = 80;
+const PROMPT_TEXTAREA_MAX_HEIGHT_PX = 2000;
+const PROMPT_TEXTAREA_STORAGE_PREFIX = `${EXTENSION_NAME}.promptTextareaHeight`;
+// 历史遗留：此前实现过 textarea 自身高度持久化（node.properties / localStorage）。
+// 当前版本以“节点缩放控制高度”为主，因此不会再读取这些持久化值；这里保留 key 仅用于兼容旧数据结构。
+const PROMPT_TEXTAREA_SCHEMA_VERSION = 2;
+const PROMPT_TEXTAREA_NODE_VERSION_PROP = `${PROMPT_TEXTAREA_STORAGE_PREFIX}.v`;
+const PROMPT_TEXTAREA_GLOBAL_VERSION_KEY = `${PROMPT_TEXTAREA_STORAGE_PREFIX}.globalV`;
+
+function clampNumber(value, min, max) {
+    if (typeof value !== "number" || !Number.isFinite(value)) return null;
+    return Math.min(max, Math.max(min, value));
+}
+
+function getNodeHeightPx(node) {
+    // 兼容 Array / TypedArray（部分前端会把 node.size 存成 Float64Array）
+    const size = node?.size;
+    if (!size || typeof size.length !== "number" || size.length < 2) return null;
+    const h = size[1];
+    return typeof h === "number" && Number.isFinite(h) ? h : null;
+}
+
+// Storage helpers removed (legacy)
+
+function findWidget(node, name) {
+    if (!node || !name) return null;
+    if (Array.isArray(node.widgets)) {
+        const hit = node.widgets.find((w) => w?.name === name);
+        if (hit) return hit;
+    }
+    if (Array.isArray(node.inputs)) {
+        for (const input of node.inputs) {
+            if (input?.name === name && input?.widget) return input.widget;
+        }
+    }
+    return null;
+}
+
+function applyPromptTextareaHeight(widget, heightPx) {
+    if (!widget) return;
+    const normalized = clampNumber(heightPx, PROMPT_TEXTAREA_MIN_HEIGHT_PX, PROMPT_TEXTAREA_MAX_HEIGHT_PX);
+    if (normalized === null) return;
+
+    // 尽量覆盖不同 ComfyUI/LiteGraph 版本的字段命名
+    try {
+        if (widget.options && typeof widget.options === "object") {
+            widget.options.height = normalized;
+        }
+    } catch (_) {
+        // ignore (read-only / sealed options)
+    }
+
+    // 新版 ComfyUI 的 BaseWidget.height 可能是只读 getter（直接赋值会抛 TypeError）
+    try {
+        widget.height = normalized;
+    } catch (_) {
+        // ignore
+    }
+
+    // 兜底：部分版本会忽略 height 字段，依赖 computeSize() 决定 widget 的占位高度
+    try {
+        // Fix: Returning 'normalized' (current height) makes the widget "rigid" to LiteGraph,
+        // preventing the user from shrinking the node.
+        // We return MIN height here so LiteGraph knows the node CAN be smaller.
+        // The actual visual height is handled by the style override below.
+        widget.computeSize = (width) => [width, PROMPT_TEXTAREA_MIN_HEIGHT_PX];
+    } catch (_) {
+        // ignore
+    }
+
+    const rawEl = widget.inputEl || widget.domEl || widget.element;
+    const textareaEl = (() => {
+        if (!rawEl) return null;
+        const tag = rawEl.tagName;
+        if (tag && String(tag).toUpperCase() === "TEXTAREA") return rawEl;
+        try {
+            if (typeof rawEl.querySelector === "function") {
+                return rawEl.querySelector("textarea");
+            }
+        } catch (_) {
+            // ignore
+        }
+        return null;
+    })();
+
+    const targets = [];
+    if (rawEl && rawEl.style) targets.push(rawEl);
+    if (textareaEl && textareaEl !== rawEl && textareaEl.style) targets.push(textareaEl);
+
+    if (targets.length) {
+        targets.forEach((el) => {
+            try {
+                const px = `${Math.round(normalized)}px`;
+                el.style.setProperty("height", px, "important");
+                el.style.setProperty("min-height", `${Math.round(PROMPT_TEXTAREA_MIN_HEIGHT_PX)}px`, "important");
+                el.style.setProperty("max-height", `${Math.round(PROMPT_TEXTAREA_MAX_HEIGHT_PX)}px`, "important");
+                // 主要由“节点缩放”控制可视范围；内容超出可视区域时仍允许滚动
+                el.style.overflowY = "auto";
+                el.style.resize = "none";
+            } catch (_) {
+                // ignore
+            }
+        });
+    }
+
+    // 记录本次生效的目标高度，避免后续依赖 DOM 读回出现不稳定
+    try {
+        widget.__bananaPromptTextareaLastAppliedHeightPx = Math.round(normalized);
+    } catch (_) {
+        // ignore
+    }
+}
+
+// Persistence binding logic removed (legacy)
+
+function normalizePromptTextareaValue(widget) {
+    if (!widget) return;
+    if (widget.value !== null && widget.value !== undefined) return;
+
+    widget.value = "";
+
+    const el = widget.inputEl || widget.domEl || widget.element;
+    if (el) {
+        try {
+            el.value = "";
+        } catch (_) {
+            // ignore
+        }
+    }
+}
+
+function setupPromptTextareas(node) {
+    if (!node) return;
+
+    const promptWidgets = [];
+    for (const name of PROMPT_TEXTAREA_WIDGET_NAMES) {
+        const widget = findWidget(node, name);
+        if (!widget) continue;
+
+        // 兼容旧工作流：缺失字段可能会被反序列化为 null，避免 UI 里显示 "null"
+        normalizePromptTextareaValue(widget);
+        promptWidgets.push({ name, widget });
+    }
+    if (promptWidgets.length === 0) return;
+
+    // Simplified logic: Just ensure initialization
+    promptWidgets.forEach(({ widget }) => {
+        if (!widget.__bananaPromptTextareaHeightInitialized) {
+            applyPromptTextareaHeight(widget, PROMPT_TEXTAREA_DEFAULT_HEIGHT_PX);
+            widget.__bananaPromptTextareaHeightInitialized = true;
+        }
+    });
+}
+
+function schedulePromptTextareaSetup(node) {
+    if (!node) return;
+    if (node.__bananaPromptTextareaSetupScheduled) return;
+    node.__bananaPromptTextareaSetupScheduled = true;
+
+    // 多次轻量重试：覆盖 ComfyUI 在 loadGraphData 后异步创建/调整 inputEl 的场景
+    const delays = [0, 50, 200, 800, 2000];
+    delays.forEach((delay) => {
+        setTimeout(() => {
+            try {
+                setupPromptTextareas(node);
+            } catch (e) {
+                console.warn(`[${EXTENSION_NAME}] schedulePromptTextareaSetup 失败（已忽略）`, e);
+            }
+        }, delay);
+    });
+}
+
+function scheduleGraphChange(node) {
+    if (!node) return;
+    const graph = node.graph || app?.graph;
+    if (!graph || typeof graph.change !== "function") return;
+
+    try {
+        if (node.__bananaSnippetGraphChangeTimer) {
+            clearTimeout(node.__bananaSnippetGraphChangeTimer);
+        }
+    } catch (_) {
+        // ignore
+    }
+
+    node.__bananaSnippetGraphChangeTimer = setTimeout(() => {
+        try {
+            graph.change();
+        } catch (_) {
+            // ignore
+        }
+    }, 200);
+}
 
 // --- API Helpers ---
 const SnippetApi = {
@@ -299,7 +503,7 @@ class SnippetManagerWidget {
     }
 
     // Helper to calculate total height needed for the widget for a given width
-    calculateContentHeight(widgetWidth, ctx) {
+    calculateContentHeight(widgetWidth, ctx, node) {
         // Must emulate the layout logic from draw()
         // Constants matching draw()
         const contentStartX = 15;
@@ -357,42 +561,220 @@ class SnippetManagerWidget {
             snipX += snipW + gap;
         });
 
-        // Final Height
+        // Final Height with Margin and Dynamic Offset
+        const WIDGET_TOP_MARGIN = 0;
+
+        // Dynamic Offset Logic:
+        // Because we force the textarea to report 60px height to LiteGraph (to allow value shrinking),
+        // we must manually reserve space if the actual DOM element is larger.
+        let offset = 0;
+        if (node) {
+            const textWidget = node.widgets.find(w => w.name === "text" || w.name === "prefix_text");
+            // Check actual DOM height if available
+            if (textWidget) {
+                let actualHeight = 60;
+                // Try to get actual visual height from DOM or internal tracking
+                if (textWidget.inputEl && textWidget.inputEl.clientHeight) {
+                    actualHeight = textWidget.inputEl.clientHeight;
+                } else if (textWidget.last_y) {
+                    // Fallback: This is harder without DOM, but draw() usually happens after DOM
+                }
+
+                // If the actual height is significantly larger than our "fake" reported 60px,
+                // we need to push the snippet widget down.
+                const PROMPT_MIN_HEIGHT = 60;
+                if (actualHeight > PROMPT_MIN_HEIGHT) {
+                    offset = actualHeight - PROMPT_MIN_HEIGHT;
+                }
+            }
+        }
+
         let requiredHeight = snipY + snipH + 10;
         if (filtered.length === 0) requiredHeight = currentY + 10;
 
-        return requiredHeight;
+        return requiredHeight + WIDGET_TOP_MARGIN + offset;
     }
 
     draw(ctx, node, widgetWidth, y, height) {
         // 1. Auto-Resize Logic (Delta Based)
-        const neededHeight = this.calculateContentHeight(widgetWidth, ctx);
+        const neededHeight = this.calculateContentHeight(widgetWidth, ctx, node);
+
+        // 记录实际布局信息：用于把节点多余空间(slack)分配给提示词输入框，避免底部出现大面积空白
+        try {
+            node.__bananaSnippetManagerWidgetTopY = y;
+            node.__bananaSnippetManagerWidgetNeededHeight = neededHeight;
+            node.__bananaSnippetManagerWidgetDrawHeight = height;
+        } catch (_) {
+            // ignore
+        }
+
+        // 当片段区第一次被绘制/布局数据可用时，触发一次 textarea 高度重算：
+        // 目的：消除“默认下方空一大截”且刷新后复现的问题。
+        // 说明：在部分前端实现里，loadGraphData -> 首次 draw 的时序晚于 onConfigure/onNodeCreated 的重试窗口。
+        try {
+            const now = Date.now();
+            const last = typeof node.__bananaPromptTextareaSetupFromSnippetDrawAt === "number"
+                ? node.__bananaPromptTextareaSetupFromSnippetDrawAt
+                : 0;
+
+            // 轻量节流：避免 draw 高频触发导致重复 DOM 写入
+            if (now - last > 150) {
+                node.__bananaPromptTextareaSetupFromSnippetDrawAt = now;
+                if (!node.__bananaPromptTextareaSetupFromSnippetDrawTimer) {
+                    node.__bananaPromptTextareaSetupFromSnippetDrawTimer = setTimeout(() => {
+                        try {
+                            node.__bananaPromptTextareaSetupFromSnippetDrawTimer = null;
+                            // setupPromptTextareas(node); // DISABLED: causes infinite resize loop
+                        } catch (e) {
+                            console.warn(`[${EXTENSION_NAME}] snippet draw -> setupPromptTextareas 失败（已忽略）`, e);
+                        }
+                    }, 0);
+                }
+            }
+        } catch (_) {
+            // ignore
+        }
 
         // Initialize if first run
         if (this.lastCalculatedHeight === undefined) {
+            // Initialize with current content height but DO NOT trigger a resize.
+            // This respects the node's saved/initial size (User Preference).
             this.lastCalculatedHeight = neededHeight;
         }
 
         const diff = neededHeight - this.lastCalculatedHeight;
 
-        // Only resize if there is a meaningful change in CONTENT height
+        // Resize only if content height changed meaningfully
+        // Resize only if content height changed meaningfully
         if (Math.abs(diff) > 1) {
             const currentWidth = node.size[0];
             const currentHeight = node.size[1];
-            node.setSize([currentWidth, currentHeight + diff]);
+
+            // New Logic: "Delta Resize"
+            // Apply the *difference* in content height to the node's total height.
+            let targetHeight = currentHeight + diff;
+
+            // Safety: Ensure we don't shrink smaller than a reasonable minimum
+            // (e.g. Snippet Widget 45px + Textarea 60px + Spacing = ~120px)
+            targetHeight = Math.max(targetHeight, 200);
+
+            try {
+                node.__bananaResizingInternally = true;
+                node.setSize([currentWidth, targetHeight]);
+            } finally {
+                node.__bananaResizingInternally = false;
+            }
             this.lastCalculatedHeight = neededHeight;
         }
 
+        // --- Fill Space Logic: Expand Textarea to eliminate bottom gap ---
+        // Only run this if we are NOT currently resizing the node (to avoid conflict)
+        // and if usage of computeSize is stable.
+        try {
+            const currentHeight = node.size[1];
+            // The widget starts at 'y'. The space required for THIS widget is 'neededHeight'.
+            // The available space for the rest (top part, mainly Textarea) is y.
+            // But we want the Snippet Widget to be at the BOTTOM.
+            // So ideally: y = currentHeight - neededHeight - bottomPadding.
+
+            // However, LiteGraph positions widgets from top to bottom. 
+            // We can't set 'y' directly. We must set the height of the element ABOVE us (Textarea).
+
+            // Current State:
+            // Node Top ----------------
+            // Textarea (Height H_t)
+            // -------------------------
+            // Snippet Widget (y, Height H_s)
+            // -------------------------
+            // Empty Space (Slack)
+            // Node Bottom -------------
+
+            // We want: Textarea Height = Textarea Height + Slack
+            // Slack = NodeHeight - (y + H_s) - BottomPadding
+
+            const bottomPadding = 10; // LiteGraph default margin roughly
+            const slack = currentHeight - (y + neededHeight) - bottomPadding;
+
+            // Only adjust if there is significant slack (positive) or overflow (negative)
+            // And ensure we don't shrink below default.
+            if (Math.abs(slack) > 4) {
+                const textWidget = node.widgets.find(w => w.name === "text" || w.name === "prefix_text");
+                if (textWidget) {
+                    // Get current height of textarea (visual or computed)
+                    // If we rely on widget.height (LiteGraph property), it might be stale?
+                    // Let's use the 'last_y' diff or just trust the loop to converge.
+
+                    // If slack is positive, we grow. If negative, we shrink.
+                    // But we must respect the MINIMUM height.
+                    const PROMPT_MIN_HEIGHT = 60; // Hardcoded safety min
+
+                    let currentTextWidgetHeight = 60;
+                    if (textWidget.last_y !== undefined && y !== undefined) {
+                        // Estimate: The space between text widget start and snippet widget start
+                        // is TextWidgetHight + Spacing.
+                        // spacing is usually 20 in LiteGraph for widgets?
+                        // Let's rely on the previous height property if set, or just use the slack to ADD to current.
+
+                        // Better: Calculate Target Height directly.
+                        // Target Textarea Height = NodeHeight - neededHeight - BottomPadding - TopPadding - Spacing
+                        // TopPadding ~30 (Title bar)
+                        // But 'y' accounts for TopPadding + Previous Widgets.
+                        // logic: slack is "how much more space we have".
+                        // So NewHeight = CurrentHeight + Slack.
+
+                        // We can deduce CurrentHeight roughly from y? 
+                        // No, 'y' is passed by drawing loop.
+
+                        // Let's assume textWidget.inputEl.style.height or widget.height is accurate-ish.
+                        if (textWidget.computeSize) {
+                            currentTextWidgetHeight = textWidget.computeSize(node.size[0])[1];
+                        }
+                    }
+
+                    let newHeight = currentTextWidgetHeight + slack;
+
+                    // Constraint: Min Height
+                    if (newHeight < PROMPT_MIN_HEIGHT) newHeight = PROMPT_MIN_HEIGHT;
+
+                    // Optimization: Don't apply if change is small (prevents jitter)
+                    if (Math.abs(newHeight - currentTextWidgetHeight) > 2) {
+                        applyPromptTextareaHeight(textWidget, newHeight);
+                    }
+                }
+            }
+        } catch (e) {
+            // console.warn("Fill Space Logic Error", e);
+        }
+
         // --- Drawing ---
+        const WIDGET_TOP_MARGIN = 0; // Visual gap from previous widget (textarea)
+
+        // Dynamic Offset Calculation (Must match calculateContentHeight)
+        let offset = 0;
+        const textWidget = node.widgets.find(w => w.name === "text" || w.name === "prefix_text");
+        if (textWidget) {
+            let actualHeight = 60;
+            if (textWidget.inputEl && textWidget.inputEl.clientHeight) {
+                actualHeight = textWidget.inputEl.clientHeight;
+            }
+            const PROMPT_MIN_HEIGHT = 60;
+            if (actualHeight > PROMPT_MIN_HEIGHT) {
+                offset = actualHeight - PROMPT_MIN_HEIGHT;
+            }
+        }
+
         // Background
         ctx.fillStyle = "#1a1a1a";
         ctx.beginPath();
-        ctx.rect(10, y, widgetWidth - 20, neededHeight);
+        // Start background AFTER the margin AND the offset
+        const bgY = y + WIDGET_TOP_MARGIN + offset;
+        const bgHeight = neededHeight - WIDGET_TOP_MARGIN - offset;
+        ctx.rect(10, bgY, widgetWidth - 20, bgHeight);
         ctx.fill();
 
         const contentStartX = 15;
         const contentWidth = widgetWidth - 30;
-        let currentY = y + 10;
+        let currentY = bgY + 10;
 
         ctx.font = "12px sans-serif";
         ctx.textAlign = "center";
@@ -569,7 +951,9 @@ class SnippetManagerWidget {
         // And we are drawing rects at 'y', 'tagY' (which was currentY)
         // Wait, my code above uses `currentY = y + 10`. So coordinates are absolute to Node Top (or wherever ctx is).
         // Yes.
-        super.drawTooltip(ctx, text, x, y, w, h, widgetWidth, widgetY);
+        if (this.tooltip) {
+            this.drawTooltip(ctx, this.tooltip, x, y, w, h, widgetWidth, widgetY);
+        }
     }
 
     // We need to keep drawTooltip definition if I didn't verify it was in the snippet I'm replacing...
@@ -830,60 +1214,181 @@ app.registerExtension({
     name: EXTENSION_NAME,
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
         if (nodeData.name === TARGET_NODE) {
+            // 前端扩展异常不能影响节点注册，否则会出现“节点变红/不可用”
+            try {
+                if (nodeType?.prototype?.__bananaSnippetManagerPatched) return;
+                nodeType.prototype.__bananaSnippetManagerPatched = true;
+            } catch (e) {
+                console.warn(`[${EXTENSION_NAME}] patch guard 失败（将继续尝试挂载）`, e);
+            }
+
+            const onConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function (configuredNodeData) {
+                let r;
+                try {
+                    r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+                } catch (e) {
+                    console.warn(`[${EXTENSION_NAME}] onConfigure 原逻辑执行失败`, e);
+                    r = undefined;
+                }
+
+                try {
+                    // 提示词输入框默认高度（仅初始化）
+                } catch (e) {
+                    console.warn(`[${EXTENSION_NAME}] 尺寸迁移逻辑已移除`);
+                }
+
+                // 提示词输入框默认高度（并在用户调整后持久化）
+                try {
+                    // setupPromptTextareas(this); // 移除旧的初始化，由 draw 循环动态接管，防止冲突
+                    // 但我们需要确保初始有一个合理的高度
+                    const textWidget = this.widgets.find(w => w.name === "text" || w.name === "prefix_text");
+                    if (textWidget) {
+                        // Apply default if really small/undefined
+                        if (!textWidget.computeSize || textWidget.computeSize(this.size[0])[1] < 60) {
+                            applyPromptTextareaHeight(textWidget, 60);
+                        }
+                    }
+                } catch (e) {
+                    console.warn(`[${EXTENSION_NAME}] setupPromptTextareas 失败（已忽略）`, e);
+                }
+
+                return r;
+            };
+
             const onNodeCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
-                const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+                let r;
+                try {
+                    r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+                } catch (e) {
+                    console.warn(`[${EXTENSION_NAME}] onNodeCreated 原逻辑执行失败`, e);
+                    r = undefined;
+                }
 
-                // Hook per-node onMouseMove to support passive hover (tooltips)
-                const origOnMouseMove = this.onMouseMove;
-                this.onMouseMove = function (event, pos) {
-                    if (origOnMouseMove) origOnMouseMove.apply(this, arguments);
+                try {
+                    // Hook per-node onMouseMove to support passive hover (tooltips)
+                    const origOnMouseMove = this.onMouseMove;
+                    this.onMouseMove = function (event, pos) {
+                        try {
+                            if (origOnMouseMove) origOnMouseMove.apply(this, arguments);
+                        } catch (e) {
+                            console.warn(`[${EXTENSION_NAME}] onMouseMove 原逻辑执行失败`, e);
+                        }
 
-                    if (this.snippetManager) {
-                        // Pass node-relative coordinates to the manager
-                        this.snippetManager.onMove(pos[0], pos[1]);
+                        try {
+                            if (this.snippetManager) {
+                                // Pass node-relative coordinates to the manager
+                                this.snippetManager.onMove(pos[0], pos[1]);
+                            }
+                        } catch (e) {
+                            console.warn(`[${EXTENSION_NAME}] tooltip hover 逻辑执行失败`, e);
+                        }
+                    };
+                } catch (e) {
+                    console.warn(`[${EXTENSION_NAME}] onMouseMove hook 挂载失败（已忽略）`, e);
+                }
+
+                try {
+                    // Add Custom Widget
+                    // 注意：部分 ComfyUI/LiteGraph 版本中，addCustomWidget 返回的 widget 上
+                    // 需要显式挂载 computeSize，LiteGraph 才会调用（否则 draw() 的 height 会一直是默认 20）。
+                    const widgetDef = {
+                        name: "snippet_manager_ui",
+                        type: "snippet_manager_debug",
+                        // Use dynamic height if available, else default
+                        computeSize: (width) => {
+                            let h = 300;
+                            if (this.snippetManager && this.snippetManager.lastCalculatedHeight) {
+                                h = this.snippetManager.lastCalculatedHeight;
+                            }
+                            return [width, h];
+                        },
+                        draw: (ctx, node, width, y, height) => {
+                            if (!this.snippetManager) {
+                                this.snippetManager = new SnippetManagerWidget(this);
+                            }
+                            this.snippetManager.draw(ctx, node, width, y, height);
+                        },
+                        mouse: (event, pos, node) => {
+                            if (event.type === "pointerdown" && this.snippetManager) {
+                                this.snippetManager.onClick(pos[0], pos[1], event);
+                            }
+                            return false;
+                        }
+                    };
+                    const widget = this.addCustomWidget(widgetDef);
+                    try {
+                        if (widget && typeof widgetDef.computeSize === "function") {
+                            widget.computeSize = widgetDef.computeSize;
+                        }
+                    } catch (_) {
+                        // ignore
                     }
-                };
+                } catch (e) {
+                    console.warn(`[${EXTENSION_NAME}] snippet_manager_ui widget 创建失败（节点仍可用）`, e);
+                }
 
-                // Add Custom Widget
-                this.addCustomWidget({
-                    name: "snippet_manager_ui",
-                    type: "snippet_manager_debug",
-                    // Use dynamic height if available, else default
-                    computeSize: (width) => {
-                        let h = 300;
-                        if (this.snippetManager && this.snippetManager.lastCalculatedHeight) {
-                            h = this.snippetManager.lastCalculatedHeight;
-                        }
-                        return [width, h];
-                    },
-                    draw: (ctx, node, width, y, height) => {
-                        if (!this.snippetManager) {
-                            this.snippetManager = new SnippetManagerWidget(this);
-                        }
-                        this.snippetManager.draw(ctx, node, width, y, height);
-                    },
-                    mouse: (event, pos, node) => {
-                        if (event.type === "pointerdown" && this.snippetManager) {
-                            this.snippetManager.onClick(pos[0], pos[1], event);
-                        }
-                        return false;
+                try {
+                    // 调整默认尺寸（仅对“新建节点”生效；不要覆盖工作流反序列化恢复的 size）
+                    // 说明：不同 ComfyUI/LiteGraph 版本里，onNodeCreated / onConfigure 的调用顺序可能不同；
+                    // 因此这里采用“下一轮事件循环再判断”的方式，避免在反序列化阶段误覆盖用户保存的尺寸。
+                    if (!this.__bananaSnippetDefaultSizeScheduled) {
+                        this.__bananaSnippetDefaultSizeScheduled = true;
+                        setTimeout(() => {
+                            try {
+                                if (this.__bananaSnippetHasSerializedSize) return;
+                                if (typeof this.setSize === "function") {
+                                    this.setSize(DEFAULT_NODE_SIZE);
+                                }
+                            } catch (e) {
+                                console.warn(`[${EXTENSION_NAME}] 默认节点尺寸延迟设置失败（已忽略）`, e);
+                            }
+                        }, 0);
                     }
-                });
+                } catch (e) {
+                    console.warn(`[${EXTENSION_NAME}] 默认节点尺寸设置失败（已忽略）`, e);
+                }
 
-                // Adjust size
-                this.setSize([500, 450]);
+                try {
+                    // 及时应用输入框高度（部分版本 inputEl 在创建后异步就绪，这里做一次轻量重试）
+                    setupPromptTextareas(this);
+                    schedulePromptTextareaSetup(this);
+                } catch (e) {
+                    console.warn(`[${EXTENSION_NAME}] 输入框高度初始化失败（已忽略）`, e);
+                }
 
-                // Removed Hook Wheel for scrolling since we now auto-expand
+                return r;
+            };
+
+            const onResize = nodeType.prototype.onResize;
+            nodeType.prototype.onResize = function () {
+                let r;
+                try {
+                    r = onResize ? onResize.apply(this, arguments) : undefined;
+                } catch (e) {
+                    console.warn(`[${EXTENSION_NAME}] onResize 原逻辑执行失败`, e);
+                    r = undefined;
+                }
+
+                // 节点尺寸变化时，不再强制 setupPromptTextareas，而是让 draw 循环自动计算填充
+                // 这样避免了 onResize -> setup -> resize -> onResize 的死循环风险
                 /*
-                const origOnMouseWheel = this.onMouseWheel;
-                this.onMouseWheel = function (event) {
-                    if (this.snippetManager && this.snippetManager.onWheel(event)) {
-                        return true; // Stop propagation
+                try {
+                    if (!this.__bananaResizingInternally) {
+                        setupPromptTextareas(this);
                     }
-                    if (origOnMouseWheel) return origOnMouseWheel.apply(this, arguments);
-                };
+                } catch (e) {
+                    console.warn(`[${EXTENSION_NAME}] onResize -> setupPromptTextareas 失败（已忽略）`, e);
+                }
                 */
+
+                // 尺寸变化需要触发图变更，确保 ComfyUI 的自动保存能够捕捉到 resize（否则刷新会回到旧尺寸）
+                try {
+                    scheduleGraphChange(this);
+                } catch (e) {
+                    console.warn(`[${EXTENSION_NAME}] onResize -> scheduleGraphChange 失败（已忽略）`, e);
+                }
 
                 return r;
             };

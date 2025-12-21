@@ -2,11 +2,11 @@ import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
 const EXTENSION = "banana.tokenBalance";
-const TARGET_NODES = new Set(["BananaImageNode"]);
+const TARGET_NODES = new Set(["BananaImageNode", "BananaImageNodeV2"]);
 const WECHAT_ID = "Li_18727107073";
 const QR_IMAGE_URL = new URL("./xinbao.png", import.meta.url).toString();
 const ACTION_BUTTON_DEFS = [
-  { key: "wechat", label: "复制微信号" },
+  { key: "wechat", label: "兑换积分" },
   { key: "query", label: "查询余额" },
   { key: "qr", label: "二维码" },
 ];
@@ -253,7 +253,7 @@ function ensureWidgets(node) {
       actionButtonMap: buttonMap,
     };
     buttonMap.wechat.onClick = () => {
-      void copyWechatId(node);
+      window.open("https://buy.xinbaoapi.dpdns.org", "_blank");
     };
     buttonMap.query.onClick = () => {
       void queryBalance(node);
